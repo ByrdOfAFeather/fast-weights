@@ -53,5 +53,5 @@ def load_episode(episode_len):
 
 	y = torch.zeros([episode_len])
 	y[pos_ind] = 1
-	return x, y
+	return x.float().cpu(), y.float().cpu()
 
