@@ -1,6 +1,18 @@
+import numpy as np
 import torch
 import torch.nn as nn
+from torch.nn.utils.rnn import PackedSequence, pack_padded_sequence
 from torch import _VF as F
+
+
+def apply_permutation(tensor, permutation, dim=1):
+	return tensor.index_select(dim, permutation)
+
+
+def permute_hidden(hx, permutation):
+	if permutation is None:
+		return hx
+	return apply_permutation(hx, permutation)
 
 
 class Linear(nn.Module):
@@ -43,30 +55,60 @@ class Linear(nn.Module):
 		return ret
 
 
-class RNN(nn.Module):
-	def __init__(self, input_size, hidden_size, device="cpu", gate_size=None):
-		super(RNN, self).__init__()
+
+
+
+class RecurrentNet(nn.Module):
+	"""
+	Currently supports RNN and LSTM
+	For RNN support: rnn = RecurrentNet(input_size, hidden_size) or rnn = RNN(input_size, hidden_size)
+	For LSTM support: rnn = RecurrentNet(input_size, hidden_size, mode="LSTM") or rnn = LSTM(input_size, hidden_size)
+	"""
+	def __init__(self, input_size, hidden_size, device="cpu", mode_name="RNN_TANH", bidirectional=False):
+		super(RecurrentNet, self).__init__()
 		self.input_size = input_size
 		self.hidden_size = hidden_size
-		self.gate_size = gate_size
+		self.gate_size = None
+		self.bidirectional = bidirectional
 		self.device = device
-		if gate_size:
-			self.hh_w = torch.rand([gate_size, hidden_size], device=self.device).float()
-			self.hi_w = torch.rand([gate_size, input_size], device=self.device).float()
-			self.no_fast_weights = gate_size * hidden_size + gate_size * input_size
+		self.mode_name = mode_name
+		self.hh_w, self.hi_w, self.no_fast_weights = None, None, None
+		self.hh_w_r, self.hi_w_r = None, None
+
+		if self.mode_name == "LSTM":
+			self.init_lstm_weights()
 			self.mode_func = F.lstm
-			self.mode_name = "LSTM"
+
 		else:
-			self.hh_w = torch.rand([hidden_size, hidden_size], device=self.device).float()
-			self.hi_w = torch.rand([hidden_size, input_size], device=self.device).float()
-			self.no_fast_weights = hidden_size * hidden_size + hidden_size * input_size
+			self.init_rnn_weights()
 			self.mode_func = F.rnn_tanh
-			self.mode_name = "RNN_TANH"
+
 		self.flat_weights = [self.hi_w, self.hh_w]
 		self.flatten_weights()
 
+	def init_weights(self, gate_size, hidden_size, input_size):
+		"""When called from RNN perspective, gate_size=hidden_size
+		"""
+		self.hh_w = torch.rand([gate_size, hidden_size], device=self.device).float()
+		self.hi_w = torch.rand([gate_size, input_size], device=self.device).float()
+		self.no_fast_weights = gate_size * hidden_size + gate_size * input_size
+		if self.bidirectional:
+			self.hh_w_r = torch.rand([gate_size, hidden_size], device=self.device).float()
+			self.hi_w_r = torch.rand([gate_size, input_size], device=self.device).float()
+			self.no_fast_weights *= 2
+
+	def init_lstm_weights(self):
+		self.gate_size = self.hidden_size * 4
+		self.init_weights(self.gate_size, self.hidden_size, self.input_size)
+
+	def init_rnn_weights(self):
+		self.init_weights(self.hidden_size, self.hidden_size, self.input_size)
+
 	def flatten_weights(self):
 		self.flat_weights = [self.hi_w, self.hh_w]
+		if self.bidirectional:
+			self.flat_weights.append(self.hi_w_r)
+			self.flat_weights.append(self.hh_w_r)
 		if self.device == "cuda":
 			import torch.backends.cudnn.rnn as rnn
 			torch._cudnn_rnn_flatten_weight(
@@ -76,35 +118,68 @@ class RNN(nn.Module):
 				False, False)
 
 	def update_weights(self, update, idx, update_func):
-		if self.gate_size:
-			end_of_weight_idx = idx + self.no_fast_weights
-			end_of_hh_idx = idx + self.gate_size * self.hidden_size
-		else:
-			end_of_weight_idx = idx + self.no_fast_weights
-			end_of_hh_idx = idx + self.hidden_size * self.hidden_size
+		end_of_forward_idx = idx + self.no_fast_weights
+		end_of_hh_idx = idx + self.hh_w.shape[0] * self.hh_w.shape[1]
 
 		hh_update = update[idx:end_of_hh_idx, :].reshape(self.hh_w.shape)
-		hi_update = update[end_of_hh_idx:end_of_weight_idx, :].reshape(self.hi_w.shape)
+		hi_update = update[end_of_hh_idx:end_of_forward_idx, :].reshape(self.hi_w.shape)
 		self.hh_w = update_func(self.hh_w, hh_update)
 		self.hi_w = update_func(self.hi_w, hi_update)
+
+		if self.bidirectional:
+			end_of_hh_r_idx = end_of_forward_idx + self.hh_w_r.shape[0] * self.hh_w_r.shape[1]
+			end_of_backward_idx = idx + self.no_fast_weights
+			hh_r_update = update[end_of_forward_idx:end_of_hh_r_idx, :].reshape(self.hh_w_r.shape)
+			hi_r_update = update[end_of_hh_r_idx: end_of_backward_idx, :].reshape(self.hi_w_r.shape)
+			self.hh_w_r = update_func(self.hh_w_r, hh_r_update)
+			self.hi_w_r = update_func(self.hi_w_r, hi_r_update)
+
 		self.flatten_weights()
 
 	def forward(self, x):
+		"""TODO : Implementation that works with PackedSequences
+		:param x:
+		:return:
+		"""
 		hx = torch.zeros(1, 1, self.hidden_size, device=self.device)
 		out, hid = self.mode_func(x, hx, self.flat_weights, False, 1, 0.0, True, False, False)
 		return out, hid
 
 
-class LSTM(RNN):
-	def __init__(self, input_size, hidden_size, device="cpu"):
-		self.mode_func = F.lstm
-		self.mode_name = "LSTM"
-		super(LSTM, self).__init__(input_size, hidden_size, device=device, gate_size=4 * hidden_size)
+class LSTM(RecurrentNet):
+	def __init__(self, input_size, hidden_size, device="cpu", bidirectional=False):
+		super(LSTM, self).__init__(input_size, hidden_size, device=device, mode_name="LSTM", bidirectional=bidirectional)
 
 	def forward(self, x):
-		h_z = torch.zeros(1, 1, self.hidden_size, device=self.device)
-		c_z = torch.zeros(1, 1, self.hidden_size, device=self.device)
+		is_packed = isinstance(x, nn.utils.rnn.PackedSequence)
+		if is_packed:
+			inputs, batch_sizes, sorted_indices, unsorted_indices = x
+			max_batch_size = int(batch_sizes[0])
+		else:
+			inputs = x
+			batch_sizes, sorted_indices, unsorted_indices = None, None, None
+			max_batch_size = inputs.size(1)
+
+		num_dim = 1
+		if self.bidirectional: num_dim = 2
+		h_z = torch.zeros(num_dim, max_batch_size, self.hidden_size, device=self.device)
+		c_z = torch.zeros(num_dim, max_batch_size, self.hidden_size, device=self.device)
 		hx = (h_z, c_z)
-		res = self.mode_func(x, hx, self.flat_weights, False, 1, 0.0, True, False, False)
-		out, hid = res[0], res[1:]
-		return out, hid
+
+		if is_packed:
+			res = self.mode_func(inputs, hx, self.flat_weights, False, 1, 0.0, True, self.bidirectional, False)
+			out, hid = res[0], res[1:]
+			output_packed = PackedSequence(out, batch_sizes, sorted_indices, unsorted_indices)
+			return output_packed, permute_hidden(hid, unsorted_indices)
+
+		else:
+			res = self.mode_func(inputs, hx, self.flat_weights, False,
+			                     1, 0.0, True, self.bidirectional, False)
+			out, hid = res[0], res[1:]
+			return out, hid
+
+
+test = LSTM(300, 128, bidirectional=False)
+# print(test(torch.rand([2, 4, 1]))[1][0].shape)
+x = test(pack_padded_sequence(torch.rand([100, 50, 300]), np.array([100-i for i in range(50)]), batch_first=False))
+print(x[1][0].shape)
