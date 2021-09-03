@@ -9,35 +9,9 @@ torch.manual_seed(225530)
 np.random.seed(225530)
 
 
-class FastNet(nn.Module):
-	def __init__(self):
-		super(FastNet, self).__init__()
-		self.prototype = None
-		self.relu = nn.ReLU()
-		self.network, self.no_fast_weights = self._build_network()
-
-	@staticmethod
-	def _count_weights(weights):
-		total_features = 0
-		for name, module in weights:
-			try:
-				total_features += module.no_fast_weights
-			except AttributeError:
-				pass
-		return total_features
-
-	def _build_network(self):
-		raise NotImplementedError
-
-	def reset(self):
-		self.network, _ = self._build_network()
-
-	def forward(self, x):
-		return self.network(x)
-
-
 class FeedForwardFastNet(FastNet):
-	def __init__(self):
+	def __init__(self, device="cpu"):
+		self.device = device
 		super(FeedForwardFastNet, self).__init__()
 		self.no_from = 6
 		self.no_to = 4
@@ -48,8 +22,8 @@ class FeedForwardFastNet(FastNet):
 				mod.reset()
 
 		self.prototype = [
-			("linear1", c.Linear(3, 3)),
-			("linear2", c.Linear(3, 1)),
+			("linear1", c.Linear(3, 100, device=self.device)),
+			("linear2", c.Linear(100, 1, device=self.device)),
 		]
 
 		def forward(x):
@@ -85,34 +59,36 @@ class RNNFastNet(FastNet):
 
 
 class BruteForceUpdater(nn.Module):
-	def __init__(self, input_size, fast_net):
+	def __init__(self, input_size, fast_net, device="cpu"):
 		super(BruteForceUpdater, self).__init__()
+		self.device = device
 		self.network = nn.Sequential(
-			nn.Linear(input_size, fast_net.no_fast_weights * 2, bias=False),
-			nn.Linear(fast_net.no_fast_weights * 2, fast_net.no_fast_weights, bias=False)
+			nn.Linear(input_size, fast_net.no_fast_weights * 2, bias=False, device=device),
+			nn.Linear(fast_net.no_fast_weights * 2, fast_net.no_fast_weights, bias=False, device=device)
 			# nn.Linear(input_size, fast_net.no_fast_weights).cpu()
 		)
 		self.relu = nn.ReLU()
 		self.fast_net = fast_net
 		self.update_func = lambda weight, update: 1 / (1 + torch.exp(-10 * (weight + update - .5)))
 
-	def update_weights(self, update):
+	def update_weights(self, update) -> int:
 		prev_weight_idx = 0
 		for name, module in self.fast_net.prototype:
 			try:
 				cur_no_weights = module.no_fast_weights
 				module.update_weights(update, prev_weight_idx, self.update_func)
 				prev_weight_idx += cur_no_weights
-			except AttributeError:
+			except AttributeError as e:
 				pass
+		return prev_weight_idx
 
 	def forward(self, x):
-		preds = torch.zeros([x.shape[0], 1])
-		weight_updates = torch.zeros([x.shape[0], self.fast_net.no_fast_weights, 1])
+		preds = torch.zeros([x.shape[0], 1], device=self.device)
+		weight_updates = torch.zeros([x.shape[0], self.fast_net.no_fast_weights, 1], device=self.device)
 		for idx, x_i in enumerate(x[:, 0, :]):
 			weight_updates[idx, :, :] = self.network(x_i).unsqueeze(1)
 			self.update_weights(weight_updates[idx, :, :])
-			preds[idx, :] = self.fast_net(x_i)
+			preds[idx, :] = self.fast_net(x_i).get_tensor()
 		return preds
 
 
@@ -133,7 +109,7 @@ class RNNUpdater(nn.Module):
 		self.fast_net = fast_net
 		self.update_func = lambda weight, update: 1 / (1 + torch.exp(-10 * (weight + update - .5)))
 
-	def update_weights(self, update):
+	def update_weights(self, update) -> int:
 		prev_weight_idx = 0
 		for name, module in self.fast_net.prototype:
 			# try:
@@ -142,6 +118,7 @@ class RNNUpdater(nn.Module):
 			prev_weight_idx += cur_no_weights
 			# except AttributeError:
 			# 	pass
+		return prev_weight_idx
 
 	def forward(self, x):
 		weight_update = self.network(x).permute(0, 2, 1).squeeze(0)

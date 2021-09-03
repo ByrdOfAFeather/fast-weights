@@ -15,13 +15,60 @@ def permute_hidden(hx, permutation):
 	return apply_permutation(hx, permutation)
 
 
+class FastTensor:
+	def __init__(self, data, *args, **kwargs):
+		self.device = kwargs.get("device", "cpu")
+
+		if isinstance(data, torch.Tensor):
+			self._tensor = data
+		else:
+			self._tensor = torch.tensor(data, *args, **kwargs)
+
+		if self.device == "cuda":
+			self._tensor = self._tensor.cuda()
+		else:
+			self._tensor = self._tensor.cpu()
+
+	def update_weights(self, update, idx, update_func) -> int:
+		new_idx = idx + np.prod(self._tensor.shape)
+		weight_update = update[idx:new_idx, :].reshape(self._tensor.shape)
+		self._tensor = update_func(self._tensor, weight_update)
+		return new_idx
+
+	def __repr__(self):
+		return "data:\n{}".format(self._tensor)
+
+	def __mul__(self, other):
+		return FastTensor(self._tensor * other, device=self.device)
+
+	def __rmul__(self, other):
+		return FastTensor(other * self._tensor, device=self.device)
+
+	def __add__(self, other):
+		return FastTensor(self._tensor + other, device=self.device)
+
+	def __radd__(self, other):
+		return FastTensor(other + self._tensor, device=self.device)
+
+	def get_tensor(self):
+		return self._tensor
+
+	def __torch_function__(self, func, types, args=(), kwargs=None):
+		if kwargs is None:
+			kwargs = {}
+		args = [a._tensor if hasattr(a, '_tensor') else a for a in args]
+		ret = func(*args, **kwargs)
+		kwargs["device"] = self.device
+		return FastTensor(ret, *args, **kwargs)
+
+
 class Linear(nn.Module):
 	def __init__(self, in_features, out_features, bias=False, device="cpu"):
 		super(Linear, self).__init__()
 		self.device = device
-		self.weight = (-1 - 1) * torch.rand([in_features, out_features], device=self.device) + 1
+		self.weight = (-1 - 1) * FastTensor(torch.rand([in_features, out_features]), device=device) + 1
 		if bias:
-			self.bias = (-1 - 1) * torch.rand([1, out_features], device=self.device) + 1
+			self.bias = (-1 - 1) * FastTensor(torch.rand([1, out_features]), device=device) + 1
 		else:
 			self.bias = None
 
@@ -35,14 +82,17 @@ class Linear(nn.Module):
 		self.no_from = in_features
 		self.no_to = out_features
 
-	def update_weights(self, update, idx, update_func):
-		end_of_weight_idx = idx + self.no_fast_weights
-		if self.bias is not None:
-			end_of_weight_idx -= self.out_features
-			bias_update = update[end_of_weight_idx: end_of_weight_idx + self.out_features, :].reshape(self.bias.shape)
-			self.bias = update_func(self.bias, bias_update)
-		weight_update = update[idx:end_of_weight_idx, :].reshape(self.weight.shape)
-		self.weight = update_func(self.weight, weight_update)
+	def update_weights(self, update, idx, update_func) -> int:
+		# end_of_weight_idx = idx + self.no_fast_weights
+		# if self.bias is not None:
+		# 	end_of_weight_idx -= self.out_features
+		# 	bias_update = update[end_of_weight_idx: end_of_weight_idx + self.out_features, :].reshape(self.bias.shape)
+		# 	self.bias = update_func(self.bias, bias_update)
+		# 	end_of_weight_idx += self.out_features
+		# weight_update = update[idx:end_of_weight_idx, :].reshape(self.weight.shape)
+		# self.weight = update_func(self.weight, weight_update)
+		end_of_weight_idx = self.weight.update_weights(update, idx, update_func)
+		return end_of_weight_idx
 
 	def reset(self):
 		self.weight = self.weight
@@ -117,24 +167,25 @@ class RecurrentNet(nn.Module):
 				self.hidden_size, 0, 1,
 				False, False)
 
-	def update_weights(self, update, idx, update_func):
-		end_of_forward_idx = idx + self.no_fast_weights
+	def update_weights(self, update, idx, update_func) -> int:
+		final_idx = idx + self.no_fast_weights
 		end_of_hh_idx = idx + self.hh_w.shape[0] * self.hh_w.shape[1]
 
 		hh_update = update[idx:end_of_hh_idx, :].reshape(self.hh_w.shape)
-		hi_update = update[end_of_hh_idx:end_of_forward_idx, :].reshape(self.hi_w.shape)
+		hi_update = update[end_of_hh_idx:final_idx, :].reshape(self.hi_w.shape)
 		self.hh_w = update_func(self.hh_w, hh_update)
 		self.hi_w = update_func(self.hi_w, hi_update)
 
 		if self.bidirectional:
-			end_of_hh_r_idx = end_of_forward_idx + self.hh_w_r.shape[0] * self.hh_w_r.shape[1]
-			end_of_backward_idx = idx + self.no_fast_weights
-			hh_r_update = update[end_of_forward_idx:end_of_hh_r_idx, :].reshape(self.hh_w_r.shape)
-			hi_r_update = update[end_of_hh_r_idx: end_of_backward_idx, :].reshape(self.hi_w_r.shape)
+			end_of_hh_r_idx = final_idx + self.hh_w_r.shape[0] * self.hh_w_r.shape[1]
+			final_idx = idx + self.no_fast_weights
+			hh_r_update = update[final_idx:end_of_hh_r_idx, :].reshape(self.hh_w_r.shape)
+			hi_r_update = update[end_of_hh_r_idx: final_idx, :].reshape(self.hi_w_r.shape)
 			self.hh_w_r = update_func(self.hh_w_r, hh_r_update)
 			self.hi_w_r = update_func(self.hi_w_r, hi_r_update)
 
 		self.flatten_weights()
+		return final_idx
 
 	def forward(self, x):
 		"""TODO : Implementation that works with PackedSequences
@@ -178,8 +229,8 @@ class LSTM(RecurrentNet):
 			out, hid = res[0], res[1:]
 			return out, hid
 
-
-test = LSTM(300, 128, bidirectional=False)
-# print(test(torch.rand([2, 4, 1]))[1][0].shape)
-x = test(pack_padded_sequence(torch.rand([100, 50, 300]), np.array([100-i for i in range(50)]), batch_first=False))
-print(x[1][0].shape)
+#
+# test = LSTM(300, 128, bidirectional=False)
+# # print(test(torch.rand([2, 4, 1]))[1][0].shape)
+# x = test(pack_padded_sequence(torch.rand([100, 50, 300]), np.array([100-i for i in range(50)]), batch_first=False))
+# print(x[1][0].shape)
