@@ -3,10 +3,48 @@ import torch.nn as nn
 import numpy as np
 import components as c
 from collections import OrderedDict
-from toy_example.data import load_episode
+from data import load_episode
 
 torch.manual_seed(225530)
 np.random.seed(225530)
+
+
+class FastNet(nn.Module):
+	def __init__(self):
+		super(FastNet, self).__init__()
+		self.prototype = None
+		self.relu = nn.ReLU()
+		self.network, self.no_fast_weights = self._build_network()
+
+	@staticmethod
+	def _count_weights(weights):
+		total_features = 0
+		for name, module in weights:
+			try:
+				total_features += module.no_fast_weights
+			except AttributeError:
+				pass
+		return total_features
+
+	def _build_network(self):
+		raise NotImplementedError
+
+	def reset(self):
+		self.network, _ = self._build_network()
+
+	def forward(self, x):
+		return self.network(x)
+
+
+class FeedForwardBaseline(nn.Module):
+	def __init__(self, device):
+		super(FeedForwardBaseline, self).__init__()
+		self.device = device
+		self.linear1 = nn.Linear(3, 100, device=self.device)
+		self.linear2 = nn.Linear(100, 1, device=self.device)
+
+	def forward(self, x):
+		return self.linear2(self.linear1(x))
 
 
 class FeedForwardFastNet(FastNet):

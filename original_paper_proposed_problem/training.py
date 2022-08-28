@@ -1,8 +1,8 @@
 from datetime import datetime
 import torch.optim
 import torch.nn as nn
-from models import FeedForwardFastNet, BruteForceUpdater, RNNBaseline, FromToUpdater, RNNFastNet, RNNUpdater
-from toy_example.data import load_episode
+from regression_models import FeedForwardFastNet, BruteForceUpdater, RNNBaseline, FromToUpdater, RNNFastNet, RNNUpdater, FeedForwardBaseline
+from data import load_episode
 torch.autograd.set_detect_anomaly(True)
 EPISODE_LEN = 100
 
@@ -21,7 +21,6 @@ def train(model, criterion, optim, episode_len, device="cpu"):
 		cur_loss.backward()
 		# print(((preds.view(-1) - y) ** 2 > .05).any())
 		# print([(name, i.grad) for name, i in model.named_parameters()])
-		# print(cur_loss)
 		# print(preds)
 		# print(y)
 		optim.step()
@@ -32,7 +31,24 @@ def train(model, criterion, optim, episode_len, device="cpu"):
 			pass
 		end = datetime.now()
 		avg_time += (end - start).total_seconds()
-	print(avg_time / 500)
+
+	avg_loss = 0
+	for i in range(100):
+		model.eval()
+		x, y = load_episode(episode_len)
+		if device == "cuda":
+			x = x.cuda()
+			y = y.cuda()
+		preds = model(x.float().unsqueeze(1))
+		cur_loss = criterion(preds.view(-1), y)
+		avg_loss += cur_loss
+		try:
+			# Sometimes we are using this function to train a non-fast weight model
+			model.fast_net.reset()
+		except AttributeError:
+			pass
+
+	print(F"Average loss for model during eval: {avg_loss / 100}")
 
 
 def train_rnn(model, criterion, optim, episode_len, device="cpu"):
@@ -54,6 +70,13 @@ def train_rnn(model, criterion, optim, episode_len, device="cpu"):
 			model.fast_net.reset()
 		except AttributeError:
 			pass
+
+
+def feed_forward_base_line():
+	baseline = FeedForwardBaseline(device="cuda")
+	criterion = nn.MSELoss(reduction="mean")
+	optimizer = torch.optim.Adam(baseline.parameters(), lr=.001)
+	train(baseline, criterion, optimizer, 300, device="cuda")
 
 
 def feed_forward_fast_weights():
@@ -78,6 +101,7 @@ def rnn_exper():
 
 
 if __name__ == "__main__":
+	feed_forward_base_line()
 	feed_forward_fast_weights()
 	# rnn_exper()
 	# print("==================")
