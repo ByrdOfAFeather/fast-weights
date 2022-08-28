@@ -1,87 +1,94 @@
 from datetime import datetime
+
+import numpy as np
 import torch.optim
 import torch.nn as nn
-from models import FeedForwardFastNet, BruteForceUpdater, RNNBaseline, FromToUpdater, RNNFastNet, RNNUpdater
-from toy_example.data import load_episode
+from torch.utils.data import DataLoader
+
+from models import LinearModel, Updater, LinearWithAdapter
+from data import IrisDataset
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
 torch.autograd.set_detect_anomaly(True)
 EPISODE_LEN = 100
 
 
-def train(model, criterion, optim, episode_len, device="cpu"):
-	avg_time = 0
-	for i in range(100):
-		start = datetime.now()
-		x, y = load_episode(episode_len)
-		if device == "cuda":
-			x = x.cuda()
-			y = y .cuda()
+def torch_input_dict(y):
+	input_tensor = torch.zeros(y.shape[0], 3)
+	for idx, y_cur in enumerate(y):
+		if y_cur == 0:
+			input_tensor[idx, :] = torch.tensor([1, 0, 0]).float()
+		elif y_cur == 1:
+			input_tensor[idx, :] = torch.tensor([0, 1, 0]).float()
+		else:
+			input_tensor[idx, :] = torch.tensor([0, 0, 1]).float()
+	return input_tensor
+
+
+def train_base_model(model, dataloader, dataloader_eval, criterion, optim, epochs=5, device="cpu", updater=False):
+	idx = 0
+	indx = []
+	losses = []
+	for i in range(epochs):
+		with torch.no_grad():
+			if updater: model.reset_weights()
+			running_loss = 0
+			accuracy_correct = 0
+			accuracy_total = 0
+			for x, y in dataloader_eval:
+				if updater:
+					# local_pred = model(torch.tensor(y).float().unsqueeze(1), x)
+					local_pred = model(torch_input_dict(y), x)
+				else:
+					local_pred = model(x)
+				running_loss += criterion(local_pred.view(-1, 3), y)
+				print(np.argmax(local_pred))
+				accuracy_correct += 1 if np.argmax(local_pred) == y else 0
+				accuracy_total += 1
+			print(f"Loss at {idx} : {running_loss}")
+			print(f"CORRECT RESPONSES: {accuracy_correct / accuracy_total}")
+			indx.append(idx)
+			losses.append(running_loss)
+
+		if updater: model.reset_weights()
 		optim.zero_grad()
-		preds = model(x.float().unsqueeze(1))
-		cur_loss = criterion(preds.view(-1), y)
-		cur_loss.backward()
-		# print(((preds.view(-1) - y) ** 2 > .05).any())
-		# print([(name, i.grad) for name, i in model.named_parameters()])
-		# print(cur_loss)
-		# print(preds)
-		# print(y)
+		for inputs, label in tqdm(dataloader):
+			if updater:
+				model_pred = model(torch_input_dict(label), x)
+			else:
+				model_pred = model(inputs)
+			loss = criterion(model_pred.view(-1, 3), label)
+			loss.backward(retain_graph=True)
+			# torch.nn.utils.clip_grad_norm_([v for i, v in model.named_parameters() if "underlying_model" not in i],
+			#                                1)
 		optim.step()
-		try:
-			# Sometimes we are using this function to train a non-fast weight model
-			model.fast_net.reset()
-		except AttributeError:
-			pass
-		end = datetime.now()
-		avg_time += (end - start).total_seconds()
-	print(avg_time / 500)
-
-
-def train_rnn(model, criterion, optim, episode_len, device="cpu"):
-	for i in range(500):
-		x, y = load_episode(episode_len)
-		if device == "cuda":
-			x, y = x.cuda(), y.cuda()
-		optim.zero_grad()
-		preds = model(x.float().unsqueeze(1))
-		cur_loss = criterion(preds.view(-1), y)
-		cur_loss.backward()
-		# print([(name, i.grad) for name, i in model.named_parameters()])
-		print(cur_loss)
-		# print(preds)
-		# print(y)
-		optim.step()
-		try:
-			# Sometimes we are using this function to train a non-fast weight model
-			model.fast_net.reset()
-		except AttributeError:
-			pass
-
-
-def feed_forward_fast_weights():
-	fast_net = FeedForwardFastNet(device="cuda")
-	updater = BruteForceUpdater(fast_net=fast_net, input_size=3, device="cuda")
-	criterion = nn.MSELoss(reduction="mean")
-	optimizer = torch.optim.Adam(updater.parameters(), lr=.001)
-	train(updater, criterion, optimizer, 300, device="cuda")
-
-def rnn_exper():
-	fast_net = RNNFastNet(3, 2, device="cuda")
-	updater = RNNUpdater(fast_net=fast_net, input_size=3, hidden_size=fast_net.no_fast_weights, device="cuda")
-	criterion = nn.MSELoss()
-	optimizer = torch.optim.Adam(updater.parameters(), lr=.00001)
-	train_rnn(updater, criterion, optimizer, EPISODE_LEN, device="cuda")
-
-# def rnn_baseline():
-# 	model = RNNBaseline()
-# 	criterion = nn.MSELoss()
-# 	optimizer = torch.optim.Adam(model.parameters(), lr=.1)
-# 	train(model, criterion, optimizer, 300)
+		idx += 1
+	plt.plot(indx, losses)
+	plt.show()
+	return model
 
 
 if __name__ == "__main__":
-	feed_forward_fast_weights()
-	# rnn_exper()
-	# print("==================")
-	# rnn_baseline()
-	# print("===============")
-	# feed_forward_fast_weights()
-	# print("=============")
+	train, val, test = DataLoader(IrisDataset("IRIS_UPDATE.csv", .8),shuffle=True, batch_size=1), DataLoader(
+		IrisDataset("IRIS_UPDATE.csv", .1), batch_size=1), DataLoader(IrisDataset("IRIS_UPDATE.csv", .1))
+	model = LinearModel(4, 3)
+	criterion = nn.CrossEntropyLoss()
+
+
+	def base_model():
+		optimizer = torch.optim.SGD(model.parameters(), lr=.00004)
+		train_base_model(model, train, val, criterion, optimizer, epochs=100)
+		torch.save(model.state_dict(), "base_model")
+
+
+	def updater_model():
+		model_adapter = LinearWithAdapter(model, 3, 3)
+		model_adapter.load_state_dict(torch.load("base_model"))
+		updater = Updater(model_adapter, 3, output_size=None)
+		optimizer = torch.optim.SGD([v for i, v in updater.named_parameters() if "underlying_model" not in i], lr=.001)
+		train_base_model(updater, train, val, criterion, optimizer, updater=True, epochs=1000)
+
+
+	# base_model()
+	updater_model()
